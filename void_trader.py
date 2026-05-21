@@ -29,11 +29,15 @@ def toggle_fullscreen():
 
 # ── CONSTANTS ──────────────────────────────────────────────────────────────────
 CHUNK_SIZE    = 5000
-CHUNKS_LOAD   = 3
+CHUNKS_LOAD   = 4
 DOCK_RADIUS   = 110
-TRADE_HALF    = 95       # half-size of trading station outer square
+TRADE_HALF    = 285      # half-size of trading station outer square
 TRADE_GAP     = 44       # half-width of entrance gap
 TRADE_DOCK_R  = 34       # inner docking circle radius
+TRADE_WALL    = 9
+HEAT_MAX      = 100.0
+HEAT_WARN     = 68.0
+HEAT_STAR_R   = 1700
 FUEL_COLL_R   = 40
 SHIP_R        = 18
 SHIP_HP_MAX   = 100
@@ -114,25 +118,25 @@ def generate_chunk(cx, cy):
     ox = cx * CHUNK_SIZE
     oy = cy * CHUNK_SIZE
     stars = [(ox+cr.randint(0,CHUNK_SIZE), oy+cr.randint(0,CHUNK_SIZE),
-              cr.choice([1,1,1,2,2,3]), cr.randint(135,195)) for _ in range(55)]
+              cr.choice([1,1,1,2,2,3]), cr.randint(135,195)) for _ in range(72)]
     occupied = []; trading = []; fuel = []
-    margin = 400
-    for _ in range(cr.randint(0, 2)):
+    margin = 900
+    for _ in range(cr.randint(1, 2)):
         for _ in range(40):
             x = ox + cr.randint(margin, CHUNK_SIZE-margin)
             y = oy + cr.randint(margin, CHUNK_SIZE-margin)
-            if all(math.hypot(x-px, y-py) > 2200 for px,py in occupied):
+            if all(math.hypot(x-px, y-py) > 3200 for px,py in occupied):
                 name = cr.choice(TRADE_NAMES)
                 prices = {g: max(5, int(b*cr.uniform(0.60,1.55))) for g,b in GOODS}
                 stock  = {g: cr.randint(0,50) for g,b in GOODS}
                 trading.append({"x":x,"y":y,"name":name,"prices":prices,"stock":stock,
                                  "entrance":cr.randint(0,3)})
                 occupied.append((x,y)); break
-    for _ in range(cr.randint(0, 1)):
+    for _ in range(cr.randint(1, 2)):
         for _ in range(40):
             x = ox + cr.randint(margin, CHUNK_SIZE-margin)
             y = oy + cr.randint(margin, CHUNK_SIZE-margin)
-            if all(math.hypot(x-px, y-py) > 1500 for px,py in occupied):
+            if all(math.hypot(x-px, y-py) > 2200 for px,py in occupied):
                 fuel.append({"x":x,"y":y,"name":cr.choice(FUEL_NAMES),
                               "fuel_price":cr.randint(6,28),
                               "rot":cr.uniform(0,360),"coll_r":FUEL_COLL_R})
@@ -268,7 +272,7 @@ class Ship:
         self.credits=5000; self.cargo={}; self.cap=24
         self.trail=[]; self.docked=None
         self.thrust_glow=0; self.hp=SHIP_HP_MAX; self.fuel=SHIP_FUEL_MAX
-        self.coll_flash=0; self.dead=False; self.no_fuel_warn=0
+        self.heat=12.0; self.thrusting=False; self.coll_flash=0; self.dead=False; self.no_fuel_warn=0
 
     @property
     def cargo_used(self): return sum(self.cargo.values())
@@ -280,7 +284,7 @@ class Ship:
     def respawn(self, st):
         self.x=st["x"]+rng.uniform(-10,10); self.y=st["y"]+rng.uniform(-10,10)
         self.vx=self.vy=0; self.angle=0; self.phase=0
-        self.hp=SHIP_HP_MAX; self.fuel=SHIP_FUEL_MAX; self.cargo={}
+        self.hp=SHIP_HP_MAX; self.fuel=SHIP_FUEL_MAX; self.cargo={}; self.heat=12.0; self.thrusting=False
         self.credits=max(500,self.credits); self.trail=[]
         self.dead=False; self.coll_flash=0; self.cooldown=0
 
@@ -291,6 +295,7 @@ class Ship:
     def update(self, keys):
         if self.docked or self.dead:
             self.vx*=0.8; self.vy*=0.8
+            self.heat=max(0.0,self.heat-0.15)
             self.thrust_glow=max(0,self.thrust_glow-1); return
         if self.cooldown>0: self.cooldown-=1
         if self.coll_flash>0: self.coll_flash-=1
@@ -300,6 +305,7 @@ class Ship:
         if keys[pygame.K_LEFT]  or keys[pygame.K_a]: self.angle-=rot
         if keys[pygame.K_RIGHT] or keys[pygame.K_d]: self.angle+=rot
         thrusting=keys[pygame.K_UP] or keys[pygame.K_w]
+        self.thrusting=thrusting
         if thrusting and self.fuel>0:
             a=math.radians(self.angle)
             self.vx+=math.sin(a)*accel; self.vy-=math.cos(a)*accel
@@ -362,6 +368,31 @@ def update_camera():
     global cam_x,cam_y
     tx=ship.x-W/2; ty=ship.y-H/2
     cam_x+=(tx-cam_x)*0.10; cam_y+=(ty-cam_y)*0.10
+
+def nearest_star_pressure(wx, wy):
+    pressure = 0.0
+    for ch in get_chunks_in_view(wx-HEAT_STAR_R, wy-HEAT_STAR_R, wx+HEAT_STAR_R, wy+HEAT_STAR_R):
+        for sx, sy, _, sb in ch["stars"]:
+            d = math.hypot(wx - sx, wy - sy)
+            if d < HEAT_STAR_R:
+                pressure = max(pressure, (HEAT_STAR_R - d) / HEAT_STAR_R * (0.65 + sb / 300.0))
+    return pressure
+
+def update_heat_and_star_damage():
+    star_pressure = nearest_star_pressure(ship.x, ship.y)
+    phase_load = [0.045, 0.10, 0.20][ship.phase]
+    speed_pressure = min(1.0, math.hypot(ship.vx, ship.vy) / max(1.0, PHASES[ship.phase][1]))
+    speed_load = [0.010, 0.024, 0.048][ship.phase]
+    if ship.thrusting:
+        ship.heat = min(HEAT_MAX, ship.heat + phase_load + speed_pressure * speed_load)
+    else:
+        ship.heat = max(0.0, ship.heat - 0.055)
+    ship.heat = min(HEAT_MAX, ship.heat + star_pressure * 0.30)
+    if ship.heat > HEAT_WARN:
+        over = ship.heat - HEAT_WARN
+        ship.hp = max(0, ship.hp - max(0, int(over / 22)))
+        if ship.hp <= 0:
+            ship.dead = True
 
 # ── NOTIFICATIONS ──────────────────────────────────────────────────────────────
 notices=[]
@@ -428,10 +459,27 @@ def draw_ship():
         gc=PHASES[ship.phase][5]
         pygame.draw.circle(screen,gc,(int(ex),int(ey)),ship.thrust_glow+rng.randint(0,3))
 
+def draw_rocket(x, y, scale=1.0, t=0):
+    bob = math.sin(t * 0.07) * 8 * scale
+    body = [
+        (x, y - 82 * scale + bob),
+        (x + 28 * scale, y + 34 * scale + bob),
+        (x, y + 18 * scale + bob),
+        (x - 28 * scale, y + 34 * scale + bob),
+    ]
+    flame_len = 26 * scale + (math.sin(t * 0.22) + 1.0) * 10 * scale
+    flame = [(x, y + 40 * scale + bob), (x - 12 * scale, y + flame_len + bob), (x + 12 * scale, y + flame_len + bob)]
+    window = (x, y - 14 * scale + bob)
+    pygame.draw.polygon(screen, (25, 28, 40), body)
+    pygame.draw.polygon(screen, (245, 245, 248), body, 3)
+    pygame.draw.polygon(screen, C_ORANGE, flame)
+    pygame.draw.circle(screen, C_CYAN, window, max(4, int(8 * scale)))
+    pygame.draw.polygon(screen, (255, 255, 255), [(x - 8 * scale, y + 2 * scale + bob), (x + 8 * scale, y + 2 * scale + bob), (x, y - 26 * scale + bob)])
+
 # ── DRAW TRADING STATIONS (big square with gap entrance) ──────────────────────
 def draw_trade_station_at(sx, sy, entrance, inside=False, show_dock=False):
     h = TRADE_HALF; g = TRADE_GAP
-    wall_col  = (60, 90, 165) if inside else (55, 75, 130)
+    wall_col  = BLACK
     inner_col = C_CYAN if inside else (80, 120, 200)
     acol      = (90, 210, 110)   # entrance arrow colour
 
@@ -448,11 +496,11 @@ def draw_trade_station_at(sx, sy, entrance, inside=False, show_dock=False):
         ndx=dx/ln; ndy=dy/ln
         ix,iy=iv
         if not is_gap:
-            pygame.draw.line(screen,wall_col,(int(p1[0]),int(p1[1])),(int(p2[0]),int(p2[1])),3)
+            pygame.draw.line(screen,wall_col,(int(p1[0]),int(p1[1])),(int(p2[0]),int(p2[1])),TRADE_WALL)
         else:
             # two solid segments flanking the gap
-            pygame.draw.line(screen,wall_col,(int(p1[0]),int(p1[1])),(int(mx-ndx*g),int(my-ndy*g)),3)
-            pygame.draw.line(screen,wall_col,(int(mx+ndx*g),int(my+ndy*g)),(int(p2[0]),int(p2[1])),3)
+            pygame.draw.line(screen,wall_col,(int(p1[0]),int(p1[1])),(int(mx-ndx*g),int(my-ndy*g)),TRADE_WALL)
+            pygame.draw.line(screen,wall_col,(int(mx+ndx*g),int(my+ndy*g)),(int(p2[0]),int(p2[1])),TRADE_WALL)
             # entrance arrows (two triangles pointing inward)
             for sign in (-1, 1):
                 # tip: slightly inside the station
@@ -484,7 +532,7 @@ def draw_trade_station_at(sx, sy, entrance, inside=False, show_dock=False):
 
 
 def draw_trading_stations():
-    margin=TRADE_HALF*2+30
+    margin=TRADE_HALF+90
     for ch in get_chunks_in_view(cam_x,cam_y,cam_x+W,cam_y+H):
         for st in ch["trading"]:
             sx,sy=w2s(st["x"],st["y"])
@@ -524,7 +572,7 @@ def draw_fuel_stations():
             dist=math.hypot(ship.x-st["x"],ship.y-st["y"])
             if dist<DOCK_RADIUS*1.5 and ship.docked is None:
                 pygame.draw.circle(screen,C_ORANGE,(int(sx),int(sy)),int(DOCK_RADIUS*0.85),1)
-                txt(screen,"[E] REFUEL/REPAIR",FSM,C_ORANGE,sx,sy+63,anchor="tc")
+                txt(screen,"[E] START REFUEL",FSM,C_ORANGE,sx,sy+63,anchor="tc")
 
 
 def draw_warp_overlay():
@@ -562,8 +610,10 @@ def draw_hud():
     for i in range(3):
         col=PHASES[i][5] if i==ship.phase else LGRAY
         bd=BLACK if i==ship.phase else GRAY
-        pygame.draw.circle(screen,col,(20+i*25,180),8)
-        pygame.draw.circle(screen,bd,(20+i*25,180),8,1)
+        pygame.draw.circle(screen,col,(34+i*25,180),8)
+        pygame.draw.circle(screen,bd,(34+i*25,180),8,1)
+    heat_col=C_ORANGE if ship.heat<HEAT_WARN else(C_YELL if ship.heat<90 else C_RED)
+    bar("HEAT",ship.heat,HEAT_MAX,heat_col,160)
     iw=pw; cargo_items=list(ship.cargo.items())
     ih=28+max(1,len(cargo_items))*18+4; iy=10+phh+8
     inv=pygame.Surface((iw,ih),pygame.SRCALPHA); inv.fill((246,246,250,210))
@@ -698,27 +748,6 @@ def draw_full_map():
         pts=ship.rotated(spx,spy,scale=ship_sc)
         pygame.draw.polygon(screen,BLACK,pts)
 
-    txt(screen,"VOID DELIVERY MAP",FLG,BLACK,W//2,pad+12,anchor="tc")
-    txt(screen,"[M] or [ESC] — Close",FSM,GRAY,W//2,pad+mh-22,anchor="tc")
-
-    # Scale bar
-    bpx=int(2000*scale)
-    if bpx>8:
-        bx2=pad+mw-24-bpx; by2=pad+mh-34
-        pygame.draw.line(screen,BLACK,(bx2,by2),(bx2+bpx,by2),2)
-        for bex in [bx2,bx2+bpx]:
-            pygame.draw.line(screen,BLACK,(bex,by2-4),(bex,by2+4),2)
-        txt(screen,"2000 u",FSM,BLACK,bx2+bpx//2,by2+5,anchor="tc")
-
-    # Legend
-    lx2=pad+12; ly2=pad+mh-54
-    pygame.draw.rect(screen,DGRAY,(lx2,ly2,8,8),1)
-    txt(screen,"Trading station",FSM,DGRAY,lx2+14,ly2-1)
-    pygame.draw.circle(screen,C_ORANGE,(lx2+4,ly2+20),4,2)
-    txt(screen,"Fuel / Repair",FSM,C_ORANGE,lx2+14,ly2+13)
-    pts2=ship.rotated(lx2+8,ly2+36,scale=0.55)
-    pygame.draw.polygon(screen,BLACK,pts2)
-    txt(screen,"Your ship",FSM,BLACK,lx2+14,ly2+27)
 
 # ── DOCKING MINIGAME ───────────────────────────────────────────────────────────
 dock_state=None; dock_target_st=None; dock_target_type=None
@@ -735,8 +764,11 @@ def start_dock_minigame(st, stype):
 def finish_dock_success():
     global dock_state
     dock_state=None
-    open_shop(dock_target_st,dock_target_type)
-    notify(f"Docked at {dock_target_st['name']}", C_GREEN)
+    if dock_target_type=="fuel":
+        start_refuel_minigame(dock_target_st)
+    else:
+        open_shop(dock_target_st,dock_target_type)
+        notify(f"Docked at {dock_target_st['name']}", C_GREEN)
 
 def finish_dock_penalty():
     global dock_state,dock_penalty_timer
@@ -973,6 +1005,219 @@ def draw_death_screen():
         txt(screen,"Press [SPACE] to respawn at nearest station",FMD,(220,180,180),W//2,H//2+36,anchor="tc")
     death_timer=min(death_timer+1,80)
 
+# ── REFUEL MINIGAME ────────────────────────────────────────────────────────────
+refuel_active=False; refuel_station=None; refuel_dragging=False
+refuel_pump_pos=[0,0]; refuel_charge=0.0
+
+def start_refuel_minigame(st):
+    global refuel_active, refuel_station, refuel_dragging, refuel_pump_pos, refuel_charge
+    refuel_station=st
+    refuel_active=True
+    refuel_dragging=False
+    refuel_charge=0.0
+    ship.docked=st
+    px=W//2-330; py=H//2-220
+    refuel_pump_pos=[px+120, py+270]
+    notify(f"REFUEL READY — {st['name']}", C_ORANGE)
+
+def finish_refuel_minigame(msg="Fuel transfer complete"):
+    global refuel_active, refuel_station, refuel_dragging, refuel_charge
+    refuel_active=False
+    refuel_dragging=False
+    refuel_charge=0.0
+    ship.docked=None
+    if msg:
+        notify(msg, C_GREEN)
+
+def abort_refuel_minigame():
+    global refuel_active, refuel_dragging, refuel_charge
+    refuel_active=False
+    refuel_dragging=False
+    refuel_charge=0.0
+    ship.docked=None
+    notify("Refuel aborted.", GRAY)
+
+def handle_refuel_event(event):
+    global refuel_dragging, refuel_pump_pos
+    if event.type==pygame.MOUSEBUTTONDOWN and event.button==1:
+        px, py = refuel_pump_pos
+        if math.hypot(event.pos[0]-px, event.pos[1]-py) < 42:
+            refuel_dragging=True
+    elif event.type==pygame.MOUSEBUTTONUP and event.button==1:
+        refuel_dragging=False
+    elif event.type==pygame.MOUSEMOTION and refuel_dragging:
+        refuel_pump_pos=[event.pos[0], event.pos[1]]
+
+def draw_refuel_minigame():
+    global refuel_charge
+    st=refuel_station
+    pw,ph=860,430; px=W//2-pw//2; py=H//2-ph//2
+    ov=pygame.Surface((W,H),pygame.SRCALPHA); ov.fill((8,12,24,210)); screen.blit(ov,(0,0))
+    panel=pygame.Surface((pw,ph),pygame.SRCALPHA); panel.fill((16,20,34,245))
+    screen.blit(panel,(px,py)); pygame.draw.rect(screen,C_ORANGE,(px,py,pw,ph),2)
+    txt(screen,"── REFUEL MINIGAME ──",FLG,C_ORANGE,W//2,py+14,anchor="tc")
+    txt(screen,st['name'],FMD,(220,230,245),W//2,py+50,anchor="tc")
+    txt(screen,f"{st['fuel_price']} CR per unit",FMD,C_YELL,W//2,py+76,anchor="tc")
+
+    hole=(px+620, py+238)
+    tank=(px+350, py+235)
+    pygame.draw.rect(screen,(40,45,60),(px+560,py+170,170,150),0)
+    pygame.draw.rect(screen,BLACK,(px+560,py+170,170,150),4)
+    pygame.draw.rect(screen,(80,85,98),(px+583,py+198,124,90),0)
+    pygame.draw.rect(screen,BLACK,(px+583,py+198,124,90),3)
+    pygame.draw.circle(screen,C_ORANGE,hole,26,5)
+    pygame.draw.circle(screen,BLACK,hole,14,0)
+    txt(screen,"FUEL HOLE",FSM,C_ORANGE,hole[0],hole[1]+34,anchor="tc")
+
+    pump_x,pump_y=refuel_pump_pos
+    inserted=math.hypot(pump_x-hole[0],pump_y-hole[1])<34
+    hose_mid=(int((pump_x+hole[0])/2), int((pump_y+hole[1])/2-40))
+    pygame.draw.lines(screen,(120,125,150),False,[tank,(hose_mid[0]-120,hose_mid[1]),hose_mid,(pump_x,pump_y)],6)
+
+    # pump tip only
+    nozzle_col=C_CYAN if inserted else (70,120,210)
+    nozzle_base=(pump_x-6,pump_y-12)
+    nozzle_tip=(pump_x+14,pump_y)
+    nozzle_end=(pump_x-6,pump_y+12)
+    pygame.draw.polygon(screen,nozzle_col,[nozzle_base,nozzle_tip,nozzle_end])
+    pygame.draw.polygon(screen,BLACK,[nozzle_base,nozzle_tip,nozzle_end],2)
+    pygame.draw.line(screen,BLACK,(pump_x-18,pump_y),(pump_x-6,pump_y),4)
+    pygame.draw.circle(screen,C_ORANGE if inserted else LGRAY,(pump_x+15,pump_y),4)
+
+    if inserted:
+        txt(screen,"PUMP LOCKED IN",FMD,C_GREEN,W//2,py+118,anchor="tc")
+        txt(screen,"Hold [E] or left mouse to transfer fuel",FSM,C_GREEN,W//2,py+142,anchor="tc")
+    else:
+        txt(screen,"Drag the pump into the hole",FMD,C_CYAN,W//2,py+118,anchor="tc")
+        txt(screen,"Then hold [E] or left mouse",FSM,C_CYAN,W//2,py+142,anchor="tc")
+
+    if inserted and (pygame.mouse.get_pressed()[0] or pygame.key.get_pressed()[pygame.K_e]):
+        if ship.credits > 0 and ship.fuel < SHIP_FUEL_MAX:
+            step=min(0.18, SHIP_FUEL_MAX-ship.fuel)
+            refuel_charge += step * st["fuel_price"]
+            spend=int(refuel_charge)
+            if spend>0:
+                ship.credits=max(0, ship.credits-spend)
+                refuel_charge-=spend
+            ship.fuel=min(SHIP_FUEL_MAX, ship.fuel+step)
+            if ship.fuel >= SHIP_FUEL_MAX - 0.001:
+                finish_refuel_minigame("Tank is full.")
+        else:
+            finish_refuel_minigame("Refuel stopped.")
+
+    bw=680
+    pygame.draw.rect(screen,LGRAY,(px+90,py+334,bw,18))
+    pygame.draw.rect(screen,C_ORANGE,(px+90,py+334,int(bw*ship.fuel/SHIP_FUEL_MAX),18))
+    txt(screen,f"Fuel: {ship.fuel:.1f} / {SHIP_FUEL_MAX:.0f}",FSM,BLACK,px+90,py+358)
+    txt(screen,f"Credits: {ship.credits:,} CR",FSM,C_YELL,px+90,py+378)
+    txt(screen,"[ESC] Abort",FSM,GRAY,W//2,py+404,anchor="tc")
+
+# ── MENU ──────────────────────────────────────────────────────────────────────
+app_state="menu"
+menu_page="main"
+menu_sel=0
+
+def start_game_from_menu():
+    global app_state, show_full_map, menu_page
+    app_state="game"
+    menu_page="main"
+    show_full_map=False
+    ship.docked=None
+    notify("VOID TRADER v5  |  TAB=phase  E=dock  M=map  F11=fullscreen", C_BLUE)
+
+def menu_items():
+    if menu_page=="main":
+        return ["PLAY", "SETTINGS", "CREDITS", "EXIT"]
+    if menu_page=="settings":
+        return [f"FULLSCREEN: {'ON' if fullscreen else 'OFF'}", "BACK"]
+    return ["BACK"]
+
+def menu_action(idx):
+    global menu_page, menu_sel
+    if menu_page=="main":
+        if idx==0: start_game_from_menu()
+        elif idx==1:
+            menu_page="settings"; menu_sel=0
+        elif idx==2:
+            menu_page="credits"; menu_sel=0
+        elif idx==3:
+            pygame.quit(); sys.exit()
+    elif menu_page=="settings":
+        if idx==0:
+            toggle_fullscreen()
+        else:
+            menu_page="main"; menu_sel=0
+    else:
+        menu_page="main"; menu_sel=0
+
+def draw_menu():
+    global menu_sel
+    t=pygame.time.get_ticks()
+    screen.fill((8, 10, 18))
+    # atmospheric background
+    for i in range(6):
+        x=int((i*211 + (t*0.03)) % (W+140)) - 70
+        y=70 + i*76
+        pygame.draw.circle(screen,(20+i*6,24+i*5,42+i*4),(x,y),3+i%2)
+    pygame.draw.rect(screen,(12,14,24),(0,0,int(W*0.67),H))
+    pygame.draw.rect(screen,(20,22,34),(int(W*0.67),0,W-int(W*0.67),H))
+    pygame.draw.polygon(screen,(18,22,35),[(0,0),(int(W*0.56),0),(int(W*0.38),H),(0,H)])
+    for i in range(12):
+        glow_x=int(115 + i*120 + math.sin((t+i*24)*0.01)*18)
+        glow_y=int(110 + math.sin((t+i*43)*0.02)*18)
+        pygame.draw.circle(screen,(35,45,72),(glow_x,glow_y),2)
+
+    draw_rocket(int(W*0.22), int(H*0.57), scale=2.15, t=t)
+    txt(screen,"VOID TRADER",FXL,(246,246,250),int(W*0.26),int(H*0.18),anchor="tc")
+    txt(screen,"SURVIVE  |  TRADE  |  REFUEL  |  EXPLORE",FMD,(160,175,195),int(W*0.26),int(H*0.18)+62,anchor="tc")
+
+    # menu panel
+    px=int(W*0.70); py=70; pw=W-px-50; ph=H-140
+    panel=pygame.Surface((pw,ph),pygame.SRCALPHA); panel.fill((14,18,30,232))
+    screen.blit(panel,(px,py)); pygame.draw.rect(screen,C_CYAN,(px,py,pw,ph),2)
+    title = "MAIN MENU" if menu_page=="main" else ("SETTINGS" if menu_page=="settings" else "CREDITS")
+    txt(screen,title,FLG,C_CYAN,px+pw//2,py+20,anchor="tc")
+    items=menu_items()
+    for i,label in enumerate(items):
+        by=py+95+i*82
+        selected=i==menu_sel
+        bg=(35,65,110) if selected else (24,30,48)
+        border=C_ORANGE if selected else (70,90,130)
+        pygame.draw.rect(screen,bg,(px+26,by,pw-52,58),0,12)
+        pygame.draw.rect(screen,border,(px+26,by,pw-52,58),2,12)
+        txt(screen,label,FMD,(250,250,252) if selected else (180,195,215),px+pw//2,by+16,anchor="tc")
+    if menu_page=="main":
+        txt(screen,"[UP/DOWN] choose   [ENTER] confirm",FSM,(130,145,170),px+pw//2,py+ph-36,anchor="tc")
+    elif menu_page=="settings":
+        txt(screen,"Toggle fullscreen with ENTER, or click it",FSM,(130,145,170),px+pw//2,py+ph-36,anchor="tc")
+    else:
+        lines=["Code and game by Void Trader", "Visual and gameplay tweaks requested by player", "", "Press BACK to return"]
+        for i,line in enumerate(lines):
+            txt(screen,line,FMD if i<2 else FSM,(180,195,215),px+pw//2,py+112+i*34,anchor="tc")
+
+def handle_menu_event(event):
+    global menu_sel, menu_page
+    items=menu_items()
+    if event.type==pygame.KEYDOWN:
+        if event.key==pygame.K_ESCAPE:
+            if menu_page=="main":
+                pygame.quit(); sys.exit()
+            menu_page="main"; menu_sel=0
+        elif event.key in (pygame.K_UP, pygame.K_w):
+            menu_sel=max(0, menu_sel-1)
+        elif event.key in (pygame.K_DOWN, pygame.K_s):
+            menu_sel=min(len(items)-1, menu_sel+1)
+        elif event.key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_e):
+            menu_action(menu_sel)
+    elif event.type==pygame.MOUSEBUTTONDOWN and event.button==1:
+        px=int(W*0.70); py=70; pw=W-px-50
+        for i in range(len(items)):
+            rect=pygame.Rect(px+26, py+95+i*82, pw-52, 58)
+            if rect.collidepoint(event.pos):
+                menu_sel=i
+                menu_action(i)
+                break
+
 # ── MAIN LOOP ──────────────────────────────────────────────────────────────────
 notify("VOID TRADER v5  |  TAB=phase  E=dock  M=map  F11=fullscreen", C_BLUE)
 
@@ -980,6 +1225,9 @@ while True:
     clock.tick(FPS)
     for event in pygame.event.get():
         if event.type==pygame.QUIT: pygame.quit(); sys.exit()
+        if app_state!="game":
+            handle_menu_event(event)
+            continue
         if event.type==pygame.KEYDOWN:
             if event.key==pygame.K_F11: toggle_fullscreen()
             elif ship.dead:
@@ -994,12 +1242,15 @@ while True:
                 handle_dock_key(event)
             elif dock_state=="penalty":
                 pass
+            elif refuel_active:
+                if event.key==pygame.K_ESCAPE:
+                    abort_refuel_minigame()
             elif shop_open:
                 handle_shop_key(event)
             else:
                 if event.key==pygame.K_ESCAPE:
                     if show_full_map: show_full_map=False
-                    else: pygame.quit(); sys.exit()
+                    else: app_state="menu"
                 elif event.key==pygame.K_m:
                     show_full_map=not show_full_map
                 elif event.key==pygame.K_TAB:
@@ -1026,12 +1277,15 @@ while True:
                                     notify(f"Must enter station first — {hints[st['entrance']]}",C_YELL)
                                     docked=True; break
                         if not docked: notify("No station in range",C_RED)
+        elif refuel_active:
+            handle_refuel_event(event)
 
     keys=pygame.key.get_pressed()
-    if not shop_open and not ship.dead and dock_state is None and not show_full_map:
+    if app_state=="game" and not shop_open and not ship.dead and dock_state is None and not refuel_active:
         ship.update(keys)
         ship.check_fuel_collisions()
         resolve_trade_walls(ship)
+        update_heat_and_star_damage()
         if ship.dead: death_timer=0
         update_camera()
     elif dock_state=="penalty":
@@ -1039,15 +1293,21 @@ while True:
     elif ship.dead:
         update_camera()
 
-    screen.fill(BG)
-    draw_stars(); draw_trail()
-    draw_trading_stations(); draw_fuel_stations()
-    if not ship.dead: draw_ship()
-    draw_warp_overlay(); draw_phase_flash(); draw_collision_flash()
-    draw_hud(); draw_minimap(); draw_notices()
-    if dock_state=="minigame":  draw_dock_minigame()
-    elif dock_state=="penalty": draw_dock_penalty()
-    elif shop_open:             draw_shop()
-    if show_full_map:           draw_full_map()
-    if ship.dead:               draw_death_screen()
+    if app_state=="menu":
+        draw_menu()
+    else:
+        screen.fill(BG)
+        draw_stars(); draw_trail()
+        draw_trading_stations(); draw_fuel_stations()
+        if not ship.dead: draw_ship()
+        draw_warp_overlay(); draw_phase_flash(); draw_collision_flash()
+        if show_full_map:
+            draw_full_map()
+        else:
+            draw_hud(); draw_minimap(); draw_notices()
+            if dock_state=="minigame":  draw_dock_minigame()
+            elif dock_state=="penalty": draw_dock_penalty()
+            elif refuel_active:          draw_refuel_minigame()
+            elif shop_open:              draw_shop()
+        if ship.dead:               draw_death_screen()
     pygame.display.flip()
