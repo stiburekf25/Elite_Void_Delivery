@@ -320,8 +320,18 @@ class Ship:
         if keys[pygame.K_DOWN] or keys[pygame.K_s]: self.vx*=0.92; self.vy*=0.92
         spd=math.hypot(self.vx,self.vy)
         if spd>max_spd: f=max_spd/spd; self.vx*=f; self.vy*=f
-        self.vx*=drag; self.vy*=drag
-        self.x+=self.vx; self.y+=self.vy
+        self.vx *= drag; self.vy *= drag
+
+        # Heat drift: přehřátí = unáší nahoru; chlazení/brzda = klesá
+        if self.heat > HEAT_WARN:
+            drift_up = (self.heat - HEAT_WARN) / (HEAT_MAX - HEAT_WARN) * 0.10
+            self.vy -= drift_up   # na obrazovce nahoru
+        elif not thrusting:
+            brk = keys[pygame.K_DOWN] or keys[pygame.K_s]
+            if brk or math.hypot(self.vx, self.vy) < 0.8:
+                self.vy += 0.04   # klesá pomalu dolů
+
+        self.x += self.vx; self.y += self.vy
         self.trail.append((self.x,self.y,self.phase))
         ml=[35,55,110][self.phase]
         if len(self.trail)>ml: self.trail.pop(0)
@@ -378,21 +388,41 @@ def nearest_star_pressure(wx, wy):
                 pressure = max(pressure, (HEAT_STAR_R - d) / HEAT_STAR_R * (0.65 + sb / 300.0))
     return pressure
 
+heat_dmg_accum = 0.0
+
 def update_heat_and_star_damage():
+    global heat_dmg_accum
+
     star_pressure = nearest_star_pressure(ship.x, ship.y)
     phase_load = [0.045, 0.10, 0.20][ship.phase]
     speed_pressure = min(1.0, math.hypot(ship.vx, ship.vy) / max(1.0, PHASES[ship.phase][1]))
     speed_load = [0.010, 0.024, 0.048][ship.phase]
+
+    keys = pygame.key.get_pressed()
+    braking = keys[pygame.K_DOWN] or keys[pygame.K_s]
+
     if ship.thrusting:
         ship.heat = min(HEAT_MAX, ship.heat + phase_load + speed_pressure * speed_load)
+    elif braking:
+        # brzda aktivně chladí 3× rychleji
+        ship.heat = max(0.0, ship.heat - 0.165)
     else:
         ship.heat = max(0.0, ship.heat - 0.055)
+
     ship.heat = min(HEAT_MAX, ship.heat + star_pressure * 0.30)
+
     if ship.heat > HEAT_WARN:
-        over = ship.heat - HEAT_WARN
-        ship.hp = max(0, ship.hp - max(0, int(over / 22)))
-        if ship.hp <= 0:
-            ship.dead = True
+        over = ship.heat - HEAT_WARN          # 0–32
+        # poškození se akumuluje – žádné náhlé skoky
+        heat_dmg_accum += over / 480.0        # max ~4 HP/sec při heat=100
+        dmg = int(heat_dmg_accum)
+        if dmg > 0:
+            heat_dmg_accum -= dmg
+            ship.hp = max(0, ship.hp - dmg)
+            if ship.hp <= 0:
+                ship.dead = True
+    else:
+        heat_dmg_accum = max(0.0, heat_dmg_accum - 0.1)   # odpouští akumulaci
 
 # ── NOTIFICATIONS ──────────────────────────────────────────────────────────────
 notices=[]
@@ -1011,13 +1041,11 @@ refuel_pump_pos=[0,0]; refuel_charge=0.0
 
 def start_refuel_minigame(st):
     global refuel_active, refuel_station, refuel_dragging, refuel_pump_pos, refuel_charge
-    refuel_station=st
-    refuel_active=True
-    refuel_dragging=False
-    refuel_charge=0.0
-    ship.docked=st
-    px=W//2-330; py=H//2-220
-    refuel_pump_pos=[px+120, py+270]
+    refuel_station = st; refuel_active = True
+    refuel_dragging = False; refuel_charge = 0.0; ship.docked = st
+    # Hadice začíná na stojanu výdejního stojanu
+    bpx = W//2 - 430; bpy = H//2 - 215
+    refuel_pump_pos = [bpx + 185, bpy + 215]
     notify(f"REFUEL READY — {st['name']}", C_ORANGE)
 
 def finish_refuel_minigame(msg="Fuel transfer complete"):
@@ -1039,185 +1067,272 @@ def abort_refuel_minigame():
 
 def handle_refuel_event(event):
     global refuel_dragging, refuel_pump_pos
-    if event.type==pygame.MOUSEBUTTONDOWN and event.button==1:
-        px, py = refuel_pump_pos
-        if math.hypot(event.pos[0]-px, event.pos[1]-py) < 42:
-            refuel_dragging=True
-    elif event.type==pygame.MOUSEBUTTONUP and event.button==1:
-        refuel_dragging=False
-    elif event.type==pygame.MOUSEMOTION and refuel_dragging:
-        refuel_pump_pos=[event.pos[0], event.pos[1]]
+    if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+        if math.hypot(event.pos[0]-refuel_pump_pos[0],
+                      event.pos[1]-refuel_pump_pos[1]) < 22:
+            refuel_dragging = True
+    elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+        refuel_dragging = False
+    elif event.type == pygame.MOUSEMOTION and refuel_dragging:
+        refuel_pump_pos = [event.pos[0], event.pos[1]]
 
 def draw_refuel_minigame():
     global refuel_charge
-    st=refuel_station
-    pw,ph=860,430; px=W//2-pw//2; py=H//2-ph//2
-    ov=pygame.Surface((W,H),pygame.SRCALPHA); ov.fill((8,12,24,210)); screen.blit(ov,(0,0))
-    panel=pygame.Surface((pw,ph),pygame.SRCALPHA); panel.fill((16,20,34,245))
-    screen.blit(panel,(px,py)); pygame.draw.rect(screen,C_ORANGE,(px,py,pw,ph),2)
-    txt(screen,"── REFUEL MINIGAME ──",FLG,C_ORANGE,W//2,py+14,anchor="tc")
+    st = refuel_station
+    pw, ph = 860, 430; px = W//2-pw//2; py = H//2-ph//2
+
+    ov = pygame.Surface((W,H), pygame.SRCALPHA); ov.fill((8,12,24,210)); screen.blit(ov,(0,0))
+    panel = pygame.Surface((pw,ph), pygame.SRCALPHA); panel.fill((16,20,34,245))
+    screen.blit(panel,(px,py)); pygame.draw.rect(screen, C_ORANGE,(px,py,pw,ph),2)
+
+    txt(screen,"── REFUEL ──",FLG,C_ORANGE,W//2,py+14,anchor="tc")
     txt(screen,st['name'],FMD,(220,230,245),W//2,py+50,anchor="tc")
-    txt(screen,f"{st['fuel_price']} CR per unit",FMD,C_YELL,W//2,py+76,anchor="tc")
+    txt(screen,f"{st['fuel_price']} CR / jednotku",FMD,C_YELL,W//2,py+76,anchor="tc")
 
-    hole=(px+620, py+238)
-    tank=(px+350, py+235)
-    pygame.draw.rect(screen,(40,45,60),(px+560,py+170,170,150),0)
-    pygame.draw.rect(screen,BLACK,(px+560,py+170,170,150),4)
-    pygame.draw.rect(screen,(80,85,98),(px+583,py+198,124,90),0)
-    pygame.draw.rect(screen,BLACK,(px+583,py+198,124,90),3)
-    pygame.draw.circle(screen,C_ORANGE,hole,26,5)
-    pygame.draw.circle(screen,BLACK,hole,14,0)
-    txt(screen,"FUEL HOLE",FSM,C_ORANGE,hole[0],hole[1]+34,anchor="tc")
+    # ── Výdejní stojan (vlevo) ────────────────────────────────────────────────
+    dx = px+150; dy = py+220
+    pygame.draw.rect(screen,(35,40,55),(dx-44,dy-100,88,180),0)
+    pygame.draw.rect(screen,C_ORANGE,  (dx-44,dy-100,88,180),3)
+    pygame.draw.rect(screen,(20,110,70),(dx-30,dy-85,60,38))
+    txt(screen,f"{st['fuel_price']}CR",FSM,C_GREEN,dx,dy-70,anchor="tc")
+    txt(screen,"FUEL",FSM,C_ORANGE,dx,dy+55,anchor="tc")
+    # Háček na pistoli
+    hx = dx+50; hy = dy-10
+    pygame.draw.line(screen,GRAY,(dx+44,hy),(hx,hy),4)
+    pygame.draw.arc(screen,GRAY,pygame.Rect(hx-8,hy-8,16,16),
+                    math.radians(270),math.radians(90),4)
 
-    pump_x,pump_y=refuel_pump_pos
-    inserted=math.hypot(pump_x-hole[0],pump_y-hole[1])<34
-    hose_mid=(int((pump_x+hole[0])/2), int((pump_y+hole[1])/2-40))
-    pygame.draw.lines(screen,(120,125,150),False,[tank,(hose_mid[0]-120,hose_mid[1]),hose_mid,(pump_x,pump_y)],6)
+    # ── Palivový port lodi (vpravo) ───────────────────────────────────────────
+    port_x = px+pw-160; port_y = py+220
+    pygame.draw.rect(screen,(45,50,65),(port_x-55,port_y-70,110,130),0)
+    pygame.draw.rect(screen,DGRAY,     (port_x-55,port_y-70,110,130),2)
+    pygame.draw.circle(screen,C_ORANGE,(port_x,port_y),24,5)
+    pygame.draw.circle(screen,BLACK,   (port_x,port_y),11,0)
+    txt(screen,"TANK",FSM,C_ORANGE,port_x,port_y+32,anchor="tc")
 
-    # pump tip only
-    nozzle_col=C_CYAN if inserted else (70,120,210)
-    nozzle_base=(pump_x-6,pump_y-12)
-    nozzle_tip=(pump_x+14,pump_y)
-    nozzle_end=(pump_x-6,pump_y+12)
-    pygame.draw.polygon(screen,nozzle_col,[nozzle_base,nozzle_tip,nozzle_end])
-    pygame.draw.polygon(screen,BLACK,[nozzle_base,nozzle_tip,nozzle_end],2)
-    pygame.draw.line(screen,BLACK,(pump_x-18,pump_y),(pump_x-6,pump_y),4)
-    pygame.draw.circle(screen,C_ORANGE if inserted else LGRAY,(pump_x+15,pump_y),4)
+    # ── Hadice – hladká křivka od stojanu k pistoli ────────────────────────────
+    pump_x,pump_y = int(refuel_pump_pos[0]), int(refuel_pump_pos[1])
+    hose_pts = []
+    sx,sy = dx+44, hy       # začátek u háčku
+    ex,ey = pump_x, pump_y  # konec u pistole
+    # 3bodový bezier přes dolní oblouk
+    cx1 = sx+60; cy1 = sy+80
+    cx2 = ex-40; cy2 = ey+60
+    for i in range(25):
+        t=i/24
+        x=int((1-t)**3*sx+3*(1-t)**2*t*cx1+3*(1-t)*t**2*cx2+t**3*ex)
+        y=int((1-t)**3*sy+3*(1-t)**2*t*cy1+3*(1-t)*t**2*cy2+t**3*ey)
+        hose_pts.append((x,y))
+    if len(hose_pts)>1:
+        pygame.draw.lines(screen,(90,95,115),False,hose_pts,6)
 
+    # ── Pistole ───────────────────────────────────────────────────────────────
+    inserted = math.hypot(pump_x-port_x, pump_y-port_y) < 28
+    col = C_CYAN if inserted else (180,110,40)
+    pygame.draw.circle(screen,col,(pump_x,pump_y),15)
+    pygame.draw.circle(screen,BLACK,(pump_x,pump_y),15,2)
+    # Špička trysky
+    tip_angle = math.atan2(port_y-pump_y, port_x-pump_x) if not inserted else 0
+    tx = int(pump_x+math.cos(tip_angle)*22)
+    ty = int(pump_y+math.sin(tip_angle)*22)
+    pygame.draw.line(screen,col,(pump_x,pump_y),(tx,ty),8)
+    pygame.draw.circle(screen,col,(tx,ty),5)
+
+    # ── Instrukce ─────────────────────────────────────────────────────────────
     if inserted:
-        txt(screen,"PUMP LOCKED IN",FMD,C_GREEN,W//2,py+118,anchor="tc")
-        txt(screen,"Hold [E] or left mouse to transfer fuel",FSM,C_GREEN,W//2,py+142,anchor="tc")
+        txt(screen,"PISTOLE ZAPOJENA — drž [E] nebo levé tlačítko",
+            FMD,C_GREEN,W//2,py+118,anchor="tc")
     else:
-        txt(screen,"Drag the pump into the hole",FMD,C_CYAN,W//2,py+118,anchor="tc")
-        txt(screen,"Then hold [E] or left mouse",FSM,C_CYAN,W//2,py+142,anchor="tc")
+        txt(screen,"Přetáhni pistoli do tankovacího portu  →",
+            FMD,C_CYAN,W//2,py+118,anchor="tc")
+        txt(screen,"(klikni na pistoli a táhni)",FSM,GRAY,W//2,py+142,anchor="tc")
 
-    if inserted and (pygame.mouse.get_pressed()[0] or pygame.key.get_pressed()[pygame.K_e]):
+    # ── Čerpání ───────────────────────────────────────────────────────────────
+    if inserted and (pygame.mouse.get_pressed()[0] or
+                     pygame.key.get_pressed()[pygame.K_e]):
         if ship.credits > 0 and ship.fuel < SHIP_FUEL_MAX:
-            step=min(0.18, SHIP_FUEL_MAX-ship.fuel)
-            refuel_charge += step * st["fuel_price"]
-            spend=int(refuel_charge)
-            if spend>0:
-                ship.credits=max(0, ship.credits-spend)
-                refuel_charge-=spend
-            ship.fuel=min(SHIP_FUEL_MAX, ship.fuel+step)
-            if ship.fuel >= SHIP_FUEL_MAX - 0.001:
-                finish_refuel_minigame("Tank is full.")
+            step = min(0.18, SHIP_FUEL_MAX-ship.fuel)
+            refuel_charge += step*st["fuel_price"]
+            spend = int(refuel_charge)
+            if spend > 0:
+                ship.credits = max(0,ship.credits-spend)
+                refuel_charge -= spend
+            ship.fuel = min(SHIP_FUEL_MAX, ship.fuel+step)
+            if ship.fuel >= SHIP_FUEL_MAX-0.001:
+                finish_refuel_minigame("Nádrž plná.")
         else:
-            finish_refuel_minigame("Refuel stopped.")
+            finish_refuel_minigame("Tankování zastaveno.")
 
-    bw=680
-    pygame.draw.rect(screen,LGRAY,(px+90,py+334,bw,18))
+    # ── Ukazatel paliva ───────────────────────────────────────────────────────
+    bw = 680
+    pygame.draw.rect(screen,LGRAY, (px+90,py+334,bw,18))
     pygame.draw.rect(screen,C_ORANGE,(px+90,py+334,int(bw*ship.fuel/SHIP_FUEL_MAX),18))
-    txt(screen,f"Fuel: {ship.fuel:.1f} / {SHIP_FUEL_MAX:.0f}",FSM,BLACK,px+90,py+358)
-    txt(screen,f"Credits: {ship.credits:,} CR",FSM,C_YELL,px+90,py+378)
-    txt(screen,"[ESC] Abort",FSM,GRAY,W//2,py+404,anchor="tc")
+    txt(screen,f"Palivo: {ship.fuel:.1f} / {SHIP_FUEL_MAX:.0f}",FSM,BLACK,px+90,py+358)
+    txt(screen,f"Kredity: {ship.credits:,} CR",FSM,C_YELL,px+90,py+378)
+    txt(screen,"[ESC] Zrušit",FSM,GRAY,W//2,py+404,anchor="tc")
 
 # ── MENU ──────────────────────────────────────────────────────────────────────
 app_state="menu"
 menu_page="main"
 menu_sel=0
+_menu_rocket_y = float(NATIVE_H) * 0.78
+_menu_particles = []
+_menu_btn_scales = [1.0] * 4
 
 def start_game_from_menu():
     global app_state, show_full_map, menu_page
-    app_state="game"
-    menu_page="main"
-    show_full_map=False
-    ship.docked=None
+    app_state="game"; menu_page="main"; show_full_map=False; ship.docked=None
     notify("VOID TRADER v5  |  TAB=phase  E=dock  M=map  F11=fullscreen", C_BLUE)
 
 def menu_items():
-    if menu_page=="main":
-        return ["PLAY", "SETTINGS", "CREDITS", "EXIT"]
-    if menu_page=="settings":
-        return [f"FULLSCREEN: {'ON' if fullscreen else 'OFF'}", "BACK"]
+    if menu_page=="main":    return ["PLAY","SETTINGS","CREDITS","EXIT"]
+    if menu_page=="settings": return [f"FULLSCREEN: {'ON' if fullscreen else 'OFF'}","BACK"]
     return ["BACK"]
 
 def menu_action(idx):
     global menu_page, menu_sel
     if menu_page=="main":
         if idx==0: start_game_from_menu()
-        elif idx==1:
-            menu_page="settings"; menu_sel=0
-        elif idx==2:
-            menu_page="credits"; menu_sel=0
-        elif idx==3:
-            pygame.quit(); sys.exit()
+        elif idx==1: menu_page="settings"; menu_sel=0
+        elif idx==2: menu_page="credits";  menu_sel=0
+        elif idx==3: pygame.quit(); sys.exit()
     elif menu_page=="settings":
-        if idx==0:
-            toggle_fullscreen()
-        else:
-            menu_page="main"; menu_sel=0
-    else:
-        menu_page="main"; menu_sel=0
+        if idx==0: toggle_fullscreen()
+        else: menu_page="main"; menu_sel=0
+    else: menu_page="main"; menu_sel=0
+
+def draw_rocket_static(x, y, scale=1.0):
+    body = [
+        (x,            y - 82*scale),
+        (x + 28*scale, y + 34*scale),
+        (x,            y + 18*scale),
+        (x - 28*scale, y + 34*scale),
+    ]
+    pygame.draw.polygon(screen, (25,28,40),    body)
+    pygame.draw.polygon(screen, (245,245,248), body, 3)
+    pygame.draw.circle(screen, C_CYAN, (int(x), int(y - 14*scale)), max(4, int(8*scale)))
+    pygame.draw.polygon(screen, (255,255,255),
+        [(x-8*scale, y+2*scale), (x+8*scale, y+2*scale), (x, y-26*scale)])
 
 def draw_menu():
-    global menu_sel
-    t=pygame.time.get_ticks()
-    screen.fill((8, 10, 18))
-    # atmospheric background
-    for i in range(6):
-        x=int((i*211 + (t*0.03)) % (W+140)) - 70
-        y=70 + i*76
-        pygame.draw.circle(screen,(20+i*6,24+i*5,42+i*4),(x,y),3+i%2)
-    pygame.draw.rect(screen,(12,14,24),(0,0,int(W*0.67),H))
-    pygame.draw.rect(screen,(20,22,34),(int(W*0.67),0,W-int(W*0.67),H))
-    pygame.draw.polygon(screen,(18,22,35),[(0,0),(int(W*0.56),0),(int(W*0.38),H),(0,H)])
-    for i in range(12):
-        glow_x=int(115 + i*120 + math.sin((t+i*24)*0.01)*18)
-        glow_y=int(110 + math.sin((t+i*43)*0.02)*18)
-        pygame.draw.circle(screen,(35,45,72),(glow_x,glow_y),2)
+    global _menu_rocket_y, _menu_particles, _menu_btn_scales
 
-    draw_rocket(int(W*0.22), int(H*0.57), scale=2.15, t=t)
-    txt(screen,"VOID TRADER",FXL,(246,246,250),int(W*0.26),int(H*0.18),anchor="tc")
-    txt(screen,"SURVIVE  |  TRADE  |  REFUEL  |  EXPLORE",FMD,(160,175,195),int(W*0.26),int(H*0.18)+62,anchor="tc")
+    screen.fill(BG)
 
-    # menu panel
-    px=int(W*0.70); py=70; pw=W-px-50; ph=H-140
-    panel=pygame.Surface((pw,ph),pygame.SRCALPHA); panel.fill((14,18,30,232))
-    screen.blit(panel,(px,py)); pygame.draw.rect(screen,C_CYAN,(px,py,pw,ph),2)
+    # Dekorativní hvězdičky
+    rng2 = random.Random(7)
+    for _ in range(90):
+        sx2 = rng2.randint(0, int(W*0.62))
+        sy2 = rng2.randint(0, H)
+        sb2 = rng2.randint(180, 220)
+        pygame.draw.circle(screen, (sb2,sb2,sb2), (sx2,sy2), rng2.choice([1,1,2]))
+
+    # Pohyb rakety
+    scale = 2.0
+    rocket_x = int(W * 0.22)
+    _menu_rocket_y -= 1.1
+    # v draw_menu(), změň:
+    if _menu_rocket_y < -160:
+        _menu_rocket_y = H + 120
+    
+
+    # Emituj částice plamene
+    ex = rocket_x
+    ey = _menu_rocket_y + 40 * scale
+    for _ in range(4):
+        _menu_particles.append({
+            'x': ex + rng.uniform(-7,7), 'y': ey + rng.uniform(0,6),
+            'vx': rng.uniform(-0.6,0.6), 'vy': rng.uniform(2.0,4.5),
+            'life': 1.0, 'decay': rng.uniform(0.018,0.032), 'size': rng.uniform(5,14),
+        })
+
+    alive = []
+    for p in _menu_particles:
+        p['x'] += p['vx']; p['y'] += p['vy']; p['vy'] += 0.06; p['life'] -= p['decay']
+        if p['life'] > 0:
+            li = p['life']; sz = max(1, int(p['size'] * li))
+            if   li > 0.75: c = (255, 230, int(100*li))
+            elif li > 0.50: c = (255, int(180*(li-0.5)*4), 0)
+            elif li > 0.25: c = (int(220*(li-0.25)*4), int(50*(li-0.25)*4), 0)
+            else:            c = (int(80*li*4), 0, 0)
+            pygame.draw.circle(screen, c, (int(p['x']), int(p['y'])), sz)
+            alive.append(p)
+    _menu_particles[:] = alive[-300:]
+
+    draw_rocket_static(rocket_x, int(_menu_rocket_y), scale=scale)
+
+    # Nadpis
+    txt(screen, "VOID TRADER", FXL, BLACK, int(W*0.26), int(H*0.11), anchor="tc")
+    txt(screen, "SURVIVE  |  TRADE  |  REFUEL  |  EXPLORE",
+        FMD, DGRAY, int(W*0.26), int(H*0.11)+52, anchor="tc")
+
+    # Bílý panel
+    px = int(W*0.65); py = 60; pw = W - px - 40; ph = H - 120
+    pygame.draw.rect(screen, (250,250,252), (px, py, pw, ph), 0, 6)
+    pygame.draw.rect(screen, BLACK,         (px, py, pw, ph), 2, 6)
     title = "MAIN MENU" if menu_page=="main" else ("SETTINGS" if menu_page=="settings" else "CREDITS")
-    txt(screen,title,FLG,C_CYAN,px+pw//2,py+20,anchor="tc")
-    items=menu_items()
-    for i,label in enumerate(items):
-        by=py+95+i*82
-        selected=i==menu_sel
-        bg=(35,65,110) if selected else (24,30,48)
-        border=C_ORANGE if selected else (70,90,130)
-        pygame.draw.rect(screen,bg,(px+26,by,pw-52,58),0,12)
-        pygame.draw.rect(screen,border,(px+26,by,pw-52,58),2,12)
-        txt(screen,label,FMD,(250,250,252) if selected else (180,195,215),px+pw//2,by+16,anchor="tc")
-    if menu_page=="main":
-        txt(screen,"[UP/DOWN] choose   [ENTER] confirm",FSM,(130,145,170),px+pw//2,py+ph-36,anchor="tc")
-    elif menu_page=="settings":
-        txt(screen,"Toggle fullscreen with ENTER, or click it",FSM,(130,145,170),px+pw//2,py+ph-36,anchor="tc")
+    txt(screen, title, FLG, BLACK, px+pw//2, py+22, anchor="tc")
+
+    items = menu_items()
+    while len(_menu_btn_scales) < len(items): _menu_btn_scales.append(1.0)
+    mouse_pos = pygame.mouse.get_pos()
+    BTN_W = pw-52; BTN_H = 56; BTN_X = px+26
+
+    if menu_page != "credits":
+        for i, label in enumerate(items):
+            base_y = py + 100 + i*76
+            hovered = BTN_X <= mouse_pos[0] <= BTN_X+BTN_W and base_y <= mouse_pos[1] <= base_y+BTN_H
+            selected = (i == menu_sel)
+            target = 1.045 if (hovered or selected) else 1.0
+            _menu_btn_scales[i] += (target - _menu_btn_scales[i]) * 0.14
+            s = _menu_btn_scales[i]
+            sw = int(BTN_W*s); sh = int(BTN_H*s)
+            bx = BTN_X + (BTN_W-sw)//2; by = base_y + (BTN_H-sh)//2
+            pygame.draw.rect(screen, LGRAY if selected else (246,246,250), (bx,by,sw,sh), 0, 10)
+            pygame.draw.rect(screen, BLACK if selected else GRAY, (bx,by,sw,sh), 2 if selected else 1, 10)
+            txt(screen, label, FMD, BLACK if selected else DGRAY,
+                px+pw//2, base_y+BTN_H//2-8, anchor="tc")
+        hint = "[↑↓] výběr   [ENTER] potvrdit" if menu_page=="main" else "ENTER přepne fullscreen"
+        txt(screen, hint, FSM, GRAY, px+pw//2, py+ph-36, anchor="tc")
     else:
-        lines=["Code and game by Void Trader", "Visual and gameplay tweaks requested by player", "", "Press BACK to return"]
-        for i,line in enumerate(lines):
-            txt(screen,line,FMD if i<2 else FSM,(180,195,215),px+pw//2,py+112+i*34,anchor="tc")
+        for i, line in enumerate(["Kód a hra: Void Trader","Vizuál: požadavky hráče","","BACK = návrat"]):
+            txt(screen, line, FMD if i<2 else FSM, DGRAY, px+pw//2, py+110+i*34, anchor="tc")
+        # BACK tlačítko pro credits
+        base_y = py+ph-90
+        hovered = BTN_X <= mouse_pos[0] <= BTN_X+BTN_W and base_y <= mouse_pos[1] <= base_y+BTN_H
+        _menu_btn_scales[0] += ((1.045 if hovered else 1.0) - _menu_btn_scales[0]) * 0.14
+        s = _menu_btn_scales[0]
+        sw = int(BTN_W*s); sh = int(BTN_H*s)
+        bx = BTN_X+(BTN_W-sw)//2; by = base_y+(BTN_H-sh)//2
+        pygame.draw.rect(screen, LGRAY, (bx,by,sw,sh), 0, 10)
+        pygame.draw.rect(screen, BLACK,  (bx,by,sw,sh), 2, 10)
+        txt(screen, "BACK", FMD, BLACK, px+pw//2, base_y+BTN_H//2-8, anchor="tc")
 
 def handle_menu_event(event):
     global menu_sel, menu_page
-    items=menu_items()
-    if event.type==pygame.KEYDOWN:
-        if event.key==pygame.K_ESCAPE:
-            if menu_page=="main":
-                pygame.quit(); sys.exit()
+    items = menu_items()
+    if event.type == pygame.KEYDOWN:
+        if event.key == pygame.K_ESCAPE:
+            if menu_page=="main": pygame.quit(); sys.exit()
             menu_page="main"; menu_sel=0
         elif event.key in (pygame.K_UP, pygame.K_w):
-            menu_sel=max(0, menu_sel-1)
+            menu_sel = max(0, menu_sel-1)
         elif event.key in (pygame.K_DOWN, pygame.K_s):
-            menu_sel=min(len(items)-1, menu_sel+1)
+            menu_sel = min(len(items)-1, menu_sel+1)
         elif event.key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_e):
             menu_action(menu_sel)
-    elif event.type==pygame.MOUSEBUTTONDOWN and event.button==1:
-        px=int(W*0.70); py=70; pw=W-px-50
-        for i in range(len(items)):
-            rect=pygame.Rect(px+26, py+95+i*82, pw-52, 58)
-            if rect.collidepoint(event.pos):
-                menu_sel=i
-                menu_action(i)
-                break
-
+    elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+        px = int(W*0.65); py = 60; pw = W-px-40
+        BTN_W = pw-52; BTN_H = 56; BTN_X = px+26
+        if menu_page == "credits":
+            base_y = py+(H-120)-90
+            if BTN_X <= event.pos[0] <= BTN_X+BTN_W and base_y <= event.pos[1] <= base_y+BTN_H:
+                menu_page="main"; menu_sel=0
+        else:
+            for i in range(len(items)):
+                rect = pygame.Rect(BTN_X, py+100+i*76, BTN_W, BTN_H)
+                if rect.collidepoint(event.pos):
+                    menu_sel=i; menu_action(i); break
 # ── MAIN LOOP ──────────────────────────────────────────────────────────────────
 notify("VOID TRADER v5  |  TAB=phase  E=dock  M=map  F11=fullscreen", C_BLUE)
 
